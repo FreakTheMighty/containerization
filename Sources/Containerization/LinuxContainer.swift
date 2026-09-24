@@ -1005,6 +1005,66 @@ extension LinuxContainer {
         }
     }
 
+    /// Suspend the container's machine to a file, release the memory it holds, and keep the
+    /// container so the *same* machine can be brought back.
+    ///
+    /// This is the in-process half of hibernation, and it exists because of how
+    /// Virtualization.framework protects the state file: its encryption key is created by the
+    /// Virtualization helper backing this machine, and a **different** helper cannot use it — a
+    /// restore from another process is refused. Stopping the machine without dropping it keeps the
+    /// same helper, so the key it made remains usable.
+    ///
+    /// The guest must not run between the save and the stop: those two steps are what make the disk
+    /// agree with the memory that was captured.
+    ///
+    /// A machine suspended this way is a *session* lifetime, not a durable one. The state file
+    /// outlives the process, but the key does not, so a machine suspended by one app run can only be
+    /// restored by that same run. Durable hibernation needs a signing identity the helper will accept
+    /// in a fresh process.
+    public func suspendToDisk(to url: URL) async throws {
+        try await self.state.withLock { state in
+            let startedState = try state.startedState("suspendToDisk")
+            try await startedState.vm.pause()
+            try await startedState.vm.saveState(to: url)
+            try await startedState.vm.stop()
+            // Still created: the machine exists and is configured, but nothing in it is running. The
+            // container is deliberately kept, which is the whole point — the helper goes with it.
+            state = .created(
+                .init(
+                    vm: startedState.vm,
+                    relayManager: startedState.relayManager,
+                    fileMountContext: startedState.fileMountContext
+                )
+            )
+        }
+    }
+
+    /// Bring back a machine suspended by ``suspendToDisk(to:)``, on the same container.
+    ///
+    /// Restores in place rather than creating anything: the virtual machine is the one that wrote the
+    /// file, which is what lets its key still be used. As with `create(restoringStateFrom:)`, none of
+    /// the guest setup runs — the round-tripped guest already did it — and the initial process handle
+    /// is adopted from the process still running inside it.
+    public func restoreInPlace(from url: URL) async throws {
+        try await self.state.withLock { state in
+            let createdState = try state.createdState("restoreInPlace")
+            try await createdState.vm.restoreState(from: url)
+            let agent = try await createdState.vm.dialAgent()
+            let process = LinuxProcess(
+                self.id,
+                containerID: self.id,
+                spec: self.generateRuntimeSpec(),
+                io: LinuxProcess.Stdio(stdin: nil, stdout: nil, stderr: nil),
+                portAllocator: self.hostVsockPorts,
+                ociRuntimePath: self.config.ociRuntimePath,
+                agent: agent,
+                vm: createdState.vm,
+                logger: self.logger
+            )
+            state = .started(.init(createdState, process: process))
+        }
+    }
+
     /// Releases a container whose virtual machine state has already been saved to disk.
     ///
     /// `stop()` is a *graceful* shutdown: it signals the guest's processes and unmounts its
