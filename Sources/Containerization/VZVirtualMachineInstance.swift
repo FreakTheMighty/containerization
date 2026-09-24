@@ -264,7 +264,12 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
             // unexpectedly virtualization framework offers you a way to store
             // an error on how it exited. We should report that here instead of the
             // generic vm is not running.
-            guard self.state == .running else {
+            //
+            // A paused machine is deliberately stoppable: Virtualization.framework permits it, and
+            // releasing a machine whose state was just saved depends on it. Resuming first would let
+            // the guest run and write to a rootfs whose in-memory state has already been captured,
+            // so the disk and the saved memory would no longer describe each other.
+            guard self.vm.state == .running || self.vm.state == .paused else {
                 throw ContainerizationError(.invalidState, message: "vm is not running")
             }
 

@@ -1001,6 +1001,46 @@ extension LinuxContainer {
         }
     }
 
+    /// Releases a container whose virtual machine state has already been saved to disk.
+    ///
+    /// `stop()` is a *graceful* shutdown: it signals the guest's processes and unmounts its
+    /// filesystems over gRPC. That is precisely wrong for a machine whose memory has just been
+    /// captured — the guest must not run again, or its rootfs would stop matching the state file.
+    /// This tears the VM down from its paused state instead and issues no guest calls at all, which
+    /// leaves the disk exactly as crash-consistent as the snapshot it was saved with.
+    ///
+    /// Nothing is unmounted and no process is signalled, so this is only correct for a machine that
+    /// is coming back from that saved state; anything else must use `stop()`.
+    public func releaseSavedMachine() async throws {
+        try await self.state.withLock { state in
+            // Calling it on an already-stopped container is allowed, like `stop()`.
+            if case .stopped = state { return }
+
+            let vm: any VirtualMachineInstance
+            let relayManager: UnixSocketRelayManager
+
+            let startedState = try? state.startedState("releaseSavedMachine")
+            if let startedState {
+                vm = startedState.vm
+                relayManager = startedState.relayManager
+            } else {
+                let createdState = try state.createdState("releaseSavedMachine")
+                vm = createdState.vm
+                relayManager = createdState.relayManager
+            }
+
+            // Host-side plumbing only; none of it talks to the guest.
+            do {
+                try await relayManager.stopAll()
+            } catch {
+                self.logger?.error("failed to stop relay manager: \(error)")
+            }
+
+            try await vm.stop()
+            state = .stopped
+        }
+    }
+
     /// Send a signal to the container.
     public func kill(_ signal: Signal) async throws {
         try await self.state.withLock {
