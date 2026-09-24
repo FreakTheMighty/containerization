@@ -602,6 +602,25 @@ extension LinuxContainer {
     /// and set up the runtime environment. The container's init process
     /// is NOT running afterwards.
     public func create() async throws {
+        try await create(restoringStateFrom: nil)
+    }
+
+    /// Create the container, optionally continuing a virtual machine whose state was saved.
+    ///
+    /// Everything this method does *after* starting the virtual machine is guest setup: mounting the
+    /// rootfs and the virtiofs shares, creating `/run/virtiofs`, writing `/etc/hosts` and
+    /// `/etc/resolv.conf`, bringing up the interfaces. A restored guest did all of that before it was
+    /// saved and its memory still holds the result, so re-running it is at best redundant and at
+    /// worst wrong — the mounts are already there, and the machine is running the processes it had.
+    ///
+    /// So when `stateURL` is given the machine is **restored instead of started**, none of that setup
+    /// runs, and the container adopts the initial process that came back with the guest. It is left in
+    /// the `started` state, because that is what it is: `start()` must not be called afterwards, as it
+    /// would launch a second init process beside the one the guest is already running.
+    ///
+    /// - Parameter stateURL: A file written by `LinuxContainer.saveState(to:)`, or `nil` for an
+    ///   ordinary cold create.
+    public func create(restoringStateFrom stateURL: URL?) async throws {
         try await self.state.withLock { state in
             try state.validateForCreate()
 
@@ -643,6 +662,32 @@ extension LinuxContainer {
             let relayManager = UnixSocketRelayManager(vm: vm, log: self.logger)
 
             do {
+                if let stateURL {
+                    // See the doc comment above: the guest already has everything the setup below
+                    // would build, so it is restored rather than started, and the container adopts
+                    // the initial process that came back with it.
+                    try await vm.restoreState(from: stateURL)
+                    let agent = try await vm.dialAgent()
+                    let process = LinuxProcess(
+                        self.id,
+                        containerID: self.id,
+                        spec: self.generateRuntimeSpec(),
+                        io: LinuxProcess.Stdio(stdin: nil, stdout: nil, stderr: nil),
+                        portAllocator: self.hostVsockPorts,
+                        ociRuntimePath: self.config.ociRuntimePath,
+                        agent: agent,
+                        vm: vm,
+                        logger: self.logger
+                    )
+                    let createdState = State.CreatedState(
+                        vm: vm,
+                        relayManager: relayManager,
+                        fileMountContext: fileMountContextHolder.withLock { $0 }
+                    )
+                    state = .started(.init(createdState, process: process))
+                    return
+                }
+
                 try await vm.start()
                 let mountsForAgent = containerMounts
                 try await vm.withAgent { agent in
@@ -839,47 +884,6 @@ extension LinuxContainer {
                 state = .started(.init(createdState, process: process))
             } catch {
                 try? await agent.close()
-                try? await createdState.vm.stop()
-                state.setErrored(error: error)
-                throw error
-            }
-        }
-    }
-
-    /// Restore a container's virtual machine from state saved by `saveState(to:)`.
-    ///
-    /// The container must be in the `created` state: its virtual machine has to have been
-    /// constructed from the same configuration that wrote the file, but never started, because
-    /// Virtualization.framework only restores into a stopped machine.
-    ///
-    /// On success the container is `started` and the guest is running the processes it had when it
-    /// was saved. The container's initial process handle is re-attached to the process still running
-    /// inside the guest; processes previously vended with `exec(_:configuration:)` are not, because
-    /// only the caller knows their ids — it reattaches those with ``attachProcess(id:)``.
-    ///
-    /// The guest's stdio plumbing does **not** survive: its pipes were wired to host vsock ports
-    /// the save cannot bring back. A restored process keeps running but its output is no longer
-    /// streamed to the host, which is why `saveState` is for a machine whose work outlives its
-    /// console, not for one whose console is the point.
-    public func restore(from url: URL) async throws {
-        try await self.state.withLock { state in
-            let createdState = try state.createdState("restore")
-            do {
-                try await createdState.vm.restoreState(from: url)
-                let agent = try await createdState.vm.dialAgent()
-                let process = LinuxProcess(
-                    self.id,
-                    containerID: self.id,
-                    spec: self.generateRuntimeSpec(),
-                    io: LinuxProcess.Stdio(stdin: nil, stdout: nil, stderr: nil),
-                    portAllocator: self.hostVsockPorts,
-                    ociRuntimePath: self.config.ociRuntimePath,
-                    agent: agent,
-                    vm: createdState.vm,
-                    logger: self.logger
-                )
-                state = .started(.init(createdState, process: process))
-            } catch {
                 try? await createdState.vm.stop()
                 state.setErrored(error: error)
                 throw error
@@ -1113,11 +1117,13 @@ extension LinuxContainer {
 
     /// Attach to a process that is already running in this container's guest.
     ///
-    /// This is the counterpart to ``restore(from:)``: the guest's process never stopped, only the
-    /// host's channel to it did, so a caller rebuilds a handle by the id it created the process with
-    /// instead of creating and starting it a second time. A process created with this method
-    /// supports `wait`, `kill` and `delete` — which is what keeps a restored workload manageable —
-    /// but its stdio is not reconnected, for the reason given on ``restore(from:)``.
+    /// This is the counterpart to ``create(restoringStateFrom:)``: the guest's process never stopped,
+    /// only the host's channel to it did, so a caller rebuilds a handle by the id it created the
+    /// process with instead of creating and starting it a second time. A process created with this
+    /// method supports `wait`, `kill` and `delete` — which is what keeps a restored workload
+    /// manageable — but its stdio is not reconnected: its pipes were wired to host vsock ports a save
+    /// cannot bring back, so a restored process keeps running while its output stops reaching the
+    /// host.
     ///
     /// Attaching to an id the guest does not know is not detected here: the guest only reports the
     /// absence when the first call naming it is made.
