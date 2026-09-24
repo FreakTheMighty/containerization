@@ -1026,7 +1026,7 @@ extension LinuxContainer {
             let startedState = try state.startedState("suspendToDisk")
             try await startedState.vm.pause()
             try await startedState.vm.saveState(to: url)
-            try await startedState.vm.stop()
+            try await startedState.vm.stopForRestore()
             // Still created: the machine exists and is configured, but nothing in it is running. The
             // container is deliberately kept, which is the whole point — the helper goes with it.
             state = .created(

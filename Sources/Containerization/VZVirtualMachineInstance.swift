@@ -258,6 +258,21 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
         }
     }
 
+    /// Stop the machine while keeping everything a restore needs.
+    ///
+    /// `stop()` closes the time syncer and shuts down the event loop group, both of which a machine
+    /// that is coming back still needs: the group carries the agent connection `restoreState(from:)`
+    /// dials, and using a shutdown group is a fatal error in SwiftNIO rather than a recoverable one.
+    public func stopForRestore() async throws {
+        try await lock.withLock { _ in
+            guard self.vm.state == .running || self.vm.state == .paused else {
+                throw ContainerizationError(.invalidState, message: "vm is not running")
+            }
+            try await self.vm.stop(queue: self.queue)
+        }
+    }
+
+    /// Stop the virtual machine.
     public func stop() async throws {
         try await lock.withLock { connections in
             // NOTE: We should record HOW the vm stopped eventually. If the vm exited

@@ -60,6 +60,17 @@ public protocol VirtualMachineInstance: Sendable {
     func start() async throws
     /// Stop the virtual machine.
     func stop() async throws
+
+    /// Stop the virtual machine, leaving the instance able to be restored again.
+    ///
+    /// Deliberately distinct from ``stop()``, which releases what a finished machine no longer needs.
+    /// A machine being suspended to disk must keep all of it: ``restoreState(from:)`` revives the same
+    /// instance, and whatever `stop()` tore down would be missing — on the macOS backend the event
+    /// loop group carries the agent connection a restore depends on, and shutting it down turns the
+    /// restore into `Cannot schedule tasks on an EventLoop that has already shut down`.
+    ///
+    /// A backend that does not distinguish the two may leave this as ``stop()``.
+    func stopForRestore() async throws
     /// Pause the virtual machine.
     func pause() async throws
     /// Resume the virtual machine.
@@ -119,6 +130,10 @@ extension VirtualMachineInstance {
     }
     public func restoreState(from url: URL) async throws {
         throw ContainerizationError(.unsupported, message: "restoreState")
+    }
+    /// Defaults to ``stop()``: a backend with nothing to preserve may tear everything down.
+    public func stopForRestore() async throws {
+        try await stop()
     }
     public func hotplug(_ block: Mount, id: String) async throws -> AttachedFilesystem {
         throw ContainerizationError(.unsupported, message: "hotplug not supported")
