@@ -205,8 +205,33 @@ public struct VmnetNetwork: Network {
             ipv4Address: v4,
             ipv4Gateway: self.ipv4Gateway,
             ipv6Address: v6,
-            ipv6Gateway: self.ipv6Gateway
+            ipv6Gateway: self.ipv6Gateway,
+            macAddress: Self.stableMACAddress(for: id)
         )
+    }
+
+    /// A stable, locally administered unicast MAC address for a container.
+    ///
+    /// Virtualization.framework's default is a random address per device, which makes every boot a
+    /// different machine as far as a saved state is concerned: restoring a virtual machine whose NIC
+    /// does not carry the address it was saved with is refused as an invalid argument. Deriving the
+    /// address from the container's id gives the same container the same NIC on every create, without
+    /// a registry that could go missing with the state file.
+    static func stableMACAddress(for id: String) -> MACAddress? {
+        // FNV-1a: small, dependency-free, and stable across processes and runs.
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in id.utf8 {
+            hash ^= UInt64(byte)
+            hash = hash &* 0x0000_0100_0000_01b3
+        }
+        var bytes = [UInt8](repeating: 0, count: 6)
+        for index in 0..<6 {
+            bytes[index] = UInt8((hash >> (UInt64(index) * 8)) & 0xff)
+        }
+        // Locally administered (bit 1 set) and unicast (bit 0 clear), so the address can never
+        // collide with a real vendor's allocation.
+        bytes[0] = (bytes[0] | 0x02) & 0xfe
+        return try? MACAddress(bytes)
     }
 
     /// Returns a new interface for use with a container with a custom MTU.
@@ -221,6 +246,7 @@ public struct VmnetNetwork: Network {
             ipv4Gateway: self.ipv4Gateway,
             ipv6Address: v6,
             ipv6Gateway: self.ipv6Gateway,
+            macAddress: Self.stableMACAddress(for: id),
             mtu: mtu
         )
     }
@@ -234,7 +260,8 @@ public struct VmnetNetwork: Network {
         return Self.Interface(
             reference: self.reference,
             ipv4Address: v4,
-            ipv6Address: v6
+            ipv6Address: v6,
+            macAddress: Self.stableMACAddress(for: id)
         )
     }
 
