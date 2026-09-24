@@ -211,6 +211,53 @@ extension VZVirtualMachineInstance: VirtualMachineInstance {
         }
     }
 
+    /// Save the paused machine's state to a file.
+    ///
+    /// The machine must be paused: Virtualization.framework refuses to save a running machine, and
+    /// `containerization` pauses the time syncer alongside the VM so the guest clock does not drift
+    /// across the save.
+    public func saveState(to url: URL) async throws {
+        try await lock.withLock { _ in
+            guard self.vm.state == .paused else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "virtual machine must be paused to save its state (is \(self.state))"
+                )
+            }
+            try await self.vm.saveMachineState(to: url, queue: self.queue)
+        }
+    }
+
+    /// Restore the machine from a file written by ``saveState(to:)`` and leave it running.
+    ///
+    /// Virtualization.framework leaves a restored machine **paused**, so this resumes it before
+    /// dialing the agent — a paused guest cannot answer a vsock connection. The agent connection is
+    /// established here exactly as ``start()`` does it, because the host-side gRPC channel does not
+    /// survive the save: only the guest's state does.
+    ///
+    /// Rosetta is deliberately not re-enabled. The saved guest state already has it, and re-running
+    /// the setup would repeat work that is part of what was restored.
+    public func restoreState(from url: URL) async throws {
+        try await lock.withLock { _ in
+            guard self.state == .stopped else {
+                throw ContainerizationError(
+                    .invalidState,
+                    message: "virtual machine is not stopped \(self.state)"
+                )
+            }
+
+            try await self.prestart()
+            try await self.vm.restoreMachineState(from: url, queue: self.queue)
+            try await self.vm.resume(queue: self.queue)
+
+            let agent = try await Vminitd(
+                connection: try await self.vm.waitForAgent(queue: self.queue),
+                group: self.group
+            )
+            await self.timeSyncer.start(context: agent)
+        }
+    }
+
     public func stop() async throws {
         try await lock.withLock { connections in
             // NOTE: We should record HOW the vm stopped eventually. If the vm exited

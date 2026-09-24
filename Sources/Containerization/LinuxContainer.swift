@@ -846,6 +846,47 @@ extension LinuxContainer {
         }
     }
 
+    /// Restore a container's virtual machine from state saved by `saveState(to:)`.
+    ///
+    /// The container must be in the `created` state: its virtual machine has to have been
+    /// constructed from the same configuration that wrote the file, but never started, because
+    /// Virtualization.framework only restores into a stopped machine.
+    ///
+    /// On success the container is `started` and the guest is running the processes it had when it
+    /// was saved. The container's initial process handle is re-attached to the process still running
+    /// inside the guest; processes previously vended with `exec(_:configuration:)` are not, because
+    /// only the caller knows their ids — it reattaches those with ``attachProcess(id:)``.
+    ///
+    /// The guest's stdio plumbing does **not** survive: its pipes were wired to host vsock ports
+    /// the save cannot bring back. A restored process keeps running but its output is no longer
+    /// streamed to the host, which is why `saveState` is for a machine whose work outlives its
+    /// console, not for one whose console is the point.
+    public func restore(from url: URL) async throws {
+        try await self.state.withLock { state in
+            let createdState = try state.createdState("restore")
+            do {
+                try await createdState.vm.restoreState(from: url)
+                let agent = try await createdState.vm.dialAgent()
+                let process = LinuxProcess(
+                    self.id,
+                    containerID: self.id,
+                    spec: self.generateRuntimeSpec(),
+                    io: LinuxProcess.Stdio(stdin: nil, stdout: nil, stderr: nil),
+                    portAllocator: self.hostVsockPorts,
+                    ociRuntimePath: self.config.ociRuntimePath,
+                    agent: agent,
+                    vm: createdState.vm,
+                    logger: self.logger
+                )
+                state = .started(.init(createdState, process: process))
+            } catch {
+                try? await createdState.vm.stop()
+                state.setErrored(error: error)
+                throw error
+            }
+        }
+    }
+
     /// Stop the container from executing. This MUST be called even if wait() has returned
     /// as their are additional resources to free.
     public func stop() async throws {
@@ -1026,6 +1067,40 @@ extension LinuxContainer {
             startedState.vendedProcesses[id] = process
             state = .started(startedState)
 
+            return process
+        }
+    }
+
+    /// Attach to a process that is already running in this container's guest.
+    ///
+    /// This is the counterpart to ``restore(from:)``: the guest's process never stopped, only the
+    /// host's channel to it did, so a caller rebuilds a handle by the id it created the process with
+    /// instead of creating and starting it a second time. A process created with this method
+    /// supports `wait`, `kill` and `delete` — which is what keeps a restored workload manageable —
+    /// but its stdio is not reconnected, for the reason given on ``restore(from:)``.
+    ///
+    /// Attaching to an id the guest does not know is not detected here: the guest only reports the
+    /// absence when the first call naming it is made.
+    public func attachProcess(id: String) async throws -> LinuxProcess {
+        try await self.state.withLock { state in
+            var startedState = try state.startedState("attachProcess")
+            let agent = try await startedState.vm.dialAgent()
+            let process = LinuxProcess(
+                id,
+                containerID: self.id,
+                spec: self.generateRuntimeSpec(),
+                io: LinuxProcess.Stdio(stdin: nil, stdout: nil, stderr: nil),
+                portAllocator: self.hostVsockPorts,
+                ociRuntimePath: self.config.ociRuntimePath,
+                agent: agent,
+                vm: startedState.vm,
+                logger: self.logger,
+                onDelete: { [weak self = self] in
+                    await self?.removeProcess(id: id)
+                }
+            )
+            startedState.vendedProcesses[id] = process
+            state = .started(startedState)
             return process
         }
     }

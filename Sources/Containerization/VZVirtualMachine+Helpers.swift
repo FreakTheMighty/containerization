@@ -119,6 +119,42 @@ extension VZVirtualMachine {
             }
         }
     }
+
+    /// Save a paused virtual machine's state to a file.
+    ///
+    /// The machine must be paused; Virtualization.framework fails the operation otherwise. The file
+    /// is encrypted with a key tied to this host, so it can only be restored here.
+    func saveMachineState(to url: URL, queue: DispatchQueue) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            queue.sync {
+                self.saveMachineStateTo(url: url) { error in
+                    if let error {
+                        cont.resume(throwing: error)
+                        return
+                    }
+                    cont.resume()
+                }
+            }
+        }
+    }
+
+    /// Restore a stopped virtual machine from a file written by `saveMachineState(to:queue:)`.
+    ///
+    /// On success the machine is left **paused**, which is the state Virtualization.framework
+    /// documents for a completed restore; the caller resumes it when it is ready.
+    func restoreMachineState(from url: URL, queue: DispatchQueue) async throws {
+        try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Void, Error>) in
+            queue.sync {
+                self.restoreMachineStateFrom(url: url) { error in
+                    if let error {
+                        cont.resume(throwing: error)
+                        return
+                    }
+                    cont.resume()
+                }
+            }
+        }
+    }
 }
 
 extension VZVirtualMachine {
